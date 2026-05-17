@@ -3,14 +3,101 @@
 <head>
   <meta charset="UTF-8">
   <title>Dogpamine</title>
-  <style>
-    body { width: 280px; padding: 24px; font-family: -apple-system, system-ui, sans-serif; }
-    h1 { margin: 0 0 8px; font-size: 16px; }
-    p { margin: 0; color: #666; font-size: 13px; line-height: 1.5; }
-  </style>
+  <link rel="stylesheet" href="popup.css">
 </head>
-<body>
-  <h1>Dogpamine 🐶</h1>
-  <p>popup UI 는 T2/T3 에서 완성됩니다. 현재는 T1 스텁.</p>
+<body data-state="loading">
+
+  <header class="header">
+    <h1 class="brand">Dogpamine <span aria-hidden="true">🐶</span></h1>
+    <span class="stage-badge" id="stage-badge" data-stage="FRESH" aria-live="polite">FRESH</span>
+  </header>
+
+  <!-- ── State: loading ─────────────────────────────────────────── -->
+  <section class="state state--loading" aria-busy="true">
+    <p class="muted">상태 불러오는 중…</p>
+  </section>
+
+  <!-- ── State: error (unsupported page) ─────────────────────────── -->
+  <section class="state state--error" role="alert">
+    <p class="error-title">이 페이지는 지원 안돼요.</p>
+    <p class="muted">YouTube Shorts 또는 Instagram Reels 에서 켜면 작동합니다.</p>
+    <div class="error-links">
+      <a href="https://www.youtube.com/shorts/" target="_blank" rel="noopener">YouTube Shorts 열기</a>
+      <a href="https://www.instagram.com/reels/" target="_blank" rel="noopener">Instagram Reels 열기</a>
+    </div>
+  </section>
+
+  <!-- ── State: off (also covers empty / first install) ──────────── -->
+  <section class="state state--off">
+    <div class="toggle-row">
+      <label class="pill" aria-label="익스텐션 활성화">
+        <input type="checkbox" id="toggle-off" class="pill__input">
+        <span class="pill__track" aria-hidden="true"><span class="pill__thumb"></span></span>
+      </label>
+      <span class="toggle-label">꺼짐</span>
+    </div>
+    <p class="hint">
+      켜면 <strong>포만감 알고리즘</strong>이 영상 체류 패턴을<br>
+      부드럽게 줄여드려요. 끄는 것도 본인 결정.
+    </p>
+  </section>
+
+  <!-- ── State: on (full active session) ─────────────────────────── -->
+  <section class="state state--on">
+    <div class="toggle-row">
+      <label class="pill pill--on" aria-label="익스텐션 활성화">
+        <input type="checkbox" id="toggle-on" class="pill__input" checked>
+        <span class="pill__track" aria-hidden="true"><span class="pill__thumb"></span></span>
+      </label>
+      <span class="toggle-label">켜짐</span>
+    </div>
+
+    <fieldset class="session" aria-label="세션 모드">
+      <legend>세션</legend>
+      <label class="radio">
+        <input type="radio" name="session" value="tab">
+        <span>지금만 <small>(탭 닫으면 끝)</small></span>
+      </label>
+      <label class="radio">
+        <input type="radio" name="session" value="today" checked>
+        <span>오늘 종일 <small>(자정까지)</small></span>
+      </label>
+      <label class="radio">
+        <input type="radio" name="session" value="oneHour">
+        <span>1시간</span>
+      </label>
+    </fieldset>
+
+    <details class="disclosure">
+      <summary>자세히 — 행동 패턴 감지</summary>
+      <dl class="stats">
+        <dt>채도</dt>      <dd id="stat-saturation"><span data-empty>—</span></dd>
+        <dt>본 영상</dt>   <dd id="stat-count"><span data-empty>측정 중…</span></dd>
+        <dt>평균 체류</dt> <dd id="stat-dwell"><span data-empty>측정 중…</span></dd>
+      </dl>
+    </details>
+
+    <button type="button" class="ghost" id="pause-btn">
+      5분만 잠깐 멈추기
+    </button>
+  </section>
+
+  <!-- ── State: paused ───────────────────────────────────────────── -->
+  <section class="state state--paused">
+    <div class="paused-card">
+      <p class="paused-title">잠깐 멈췄어요</p>
+      <p class="paused-time">남은 시간 <strong id="pause-remaining">5:00</strong></p>
+    </div>
+    <button type="button" class="primary" id="resume-btn">
+      지금 재개
+    </button>
+    <p class="hint muted">멈춰도 토글은 켜져 있어요. 시간 끝나면 자동 재개.</p>
+  </section>
+
+  <footer class="footer">
+    <span class="legend">행동 패턴 감지 · 데이터는 이 기기에만 저장됨</span>
+  </footer>
+
+  <script src="popup.js"></script>
 </body>
 </html>
