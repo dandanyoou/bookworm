@@ -1,128 +1,339 @@
-// Dogpamine — Instagram Reels 용 content script
+// Dogpamine — content script (v0.2.0).
 //
-// 역할:
-//   1) IntersectionObserver 로 reel 별 <video> 체류 시간(dwell time) 측정
-//   2) 최근 5개 reel 의 평균 dwell 이 임계값 깨면 단계 진행 (단방향)
-//   3) 단계 진행 시 <html> 의 saturate() 필터 단계적 감소
+// 단방향 데이터 흐름: chrome.storage 가 진실의 소스.
+//   storage.enabled = true  → attach() (observers, expiry tick, stage)
+//   storage.enabled = false → detach() (cleanup, reset saturation)
 //
-// 단계 진행 트리거는 100% 행동 기반. 시간 기반 진행 없음.
-// Mock SNS (app.js) 의 검증된 dwell 로직과 동일한 STAGES / maybeAdvanceStage 구조.
+// 핵심 결정 (autoplan T4 Eng 검토 통합):
+//   - SITE_CONFIG 어댑터 패턴 (YouTube Shorts + Instagram Reels)
+//   - styleEl 즉시 inject saturate(100%) no-op → 페이지 깜빡임 차단 (Eng 5)
+//   - Init race fix: monotonic storageChangeCounter (Eng 1)
+//   - Map-tracked IntersectionObservers → detach() 에서 깨끗히 정리 (Eng 2)
+//   - 60s self-expiry safety net (SW dormancy 대비, Eng 3)
+//   - KST 자정은 lib/session.js 위임 (Eng 4)
+//   - popup 에 push (chrome.runtime.sendMessage), get-state 응답 (Eng 6)
+//   - MutationObserver: 좁은 root + requestIdleCallback + 100ms debounce (Eng 8)
+//   - Extension context invalidation 시 graceful cleanup (Eng Q)
+//   - pausedUntil 매 dwell tick 체크 (단계 진행 일시정지)
 
-const STAGES = [
-  { dwellLt: Infinity, saturation: 100, label: 'FRESH' },
-  { dwellLt: 6,        saturation: 90,  label: 'WARMING' },
-  { dwellLt: 4,        saturation: 75,  label: 'DRIFTING' },
-  { dwellLt: 3,        saturation: 60,  label: 'FADING' },
-  { dwellLt: 2,        saturation: 45,  label: 'QUIETING' },
-  { dwellLt: 1.5,      saturation: 35,  label: 'STILL' },
-];
+(() => {
+  'use strict';
 
-const state = {
-  currentStageIdx: 0,
-  recentDwells: [],
-  dwellWindow: 5,
-  observedVideoCount: 0,
-  measuredDwellCount: 0,
-};
+  // ── 1. Site config ────────────────────────────────────────────────
+  const SITE_CONFIG = {
+    'youtube.com': {
+      urlPattern: /\/shorts\//,
+      videoSelector: 'ytd-reel-video-renderer video, #shorts-player video, video',
+      mutationRoot: () => document.querySelector('ytd-shorts, ytd-app') || document.body,
+      name: 'YouTube',
+    },
+    'instagram.com': {
+      urlPattern: /\/reels\//,
+      videoSelector: 'main video',
+      mutationRoot: () => document.querySelector('main') || document.body,
+      name: 'Instagram',
+    },
+  };
 
-// ── CSS 주입 ────────────────────────────────────────────
-// transition 으로 채도 변화가 1.5초에 걸쳐 부드럽게 보이게 한다.
-// 인라인 <style> 가 CSP 에 막히면 chrome.scripting.insertCSS 로 전환 필요 (현재는 시도).
-const styleEl = document.createElement('style');
-styleEl.id = 'dogpamine-filter';
-styleEl.textContent = 'html { filter: saturate(100%); transition: filter 1.5s ease; }';
-document.documentElement.appendChild(styleEl);
+  const host = location.hostname.replace(/^www\./, '');
+  const site = SITE_CONFIG[host];
+  if (!site) return;
 
-function applyStage() {
-  const stage = STAGES[state.currentStageIdx];
-  styleEl.textContent =
-    `html { filter: saturate(${stage.saturation}%); transition: filter 1.5s ease; }`;
-}
+  const onSupportedPath = () => site.urlPattern.test(location.pathname);
 
-// ── 단계 진행 판단 ──────────────────────────────────────
-// 가장 높은 단계부터 검색해서 첫 매치. i > currentStageIdx 로만 진행 → 단방향.
-function maybeAdvanceStage() {
-  if (state.recentDwells.length < state.dwellWindow) return; // 워밍업
-  const avgDwellSec =
-    state.recentDwells.reduce((a, b) => a + b, 0) / state.recentDwells.length / 1000;
-  for (let i = STAGES.length - 1; i > state.currentStageIdx; i--) {
-    if (avgDwellSec < STAGES[i].dwellLt) {
-      state.currentStageIdx = i;
-      console.log(
-        `[Dogpamine] Stage → ${STAGES[i].label} ` +
-          `(avg dwell ${avgDwellSec.toFixed(2)}s, sat ${STAGES[i].saturation}%)`
-      );
-      applyStage();
-      break;
+  // ── 2. Stages + constants ────────────────────────────────────────
+  const STAGES = [
+    { dwellLt: Infinity, saturation: 100, overlay: false, label: 'FRESH' },
+    { dwellLt: 6,        saturation: 90,  overlay: false, label: 'WARMING' },
+    { dwellLt: 4,        saturation: 75,  overlay: false, label: 'DRIFTING' },
+    { dwellLt: 3,        saturation: 60,  overlay: false, label: 'FADING' },
+    { dwellLt: 2,        saturation: 45,  overlay: false, label: 'QUIETING' },
+    { dwellLt: 1.5,      saturation: 35,  overlay: true,  label: 'STOP' },
+  ];
+
+  const DWELL_WINDOW = 5;
+  const EXPIRY_CHECK_MS = 60_000;
+  const DISCOVERY_DEBOUNCE_MS = 100;
+  const PUSH_THROTTLE_MS = 1000;
+
+  // ── 3. State ──────────────────────────────────────────────────────
+  const state = {
+    attached: false,
+    currentStageIdx: 0,
+    recentDwells: [],
+    measuredDwellCount: 0,
+    observedVideoCount: 0,
+    overlayDismissed: false,
+    videoObservers: new Map(),  // video → IntersectionObserver
+    mutationObserver: null,
+    expiryHandle: null,
+    pausedUntil: null,
+    storageChangeCounter: 0,
+    initSnapshotCounter: 0,
+    lastPushAt: 0,
+  };
+
+  const isExtensionAlive = () => {
+    try { return !!chrome.runtime?.id; } catch { return false; }
+  };
+
+  // ── 4. Style element (synchronous no-op — Eng 5: no flash) ────────
+  const styleEl = document.createElement('style');
+  styleEl.id = 'dogpamine-filter';
+  styleEl.textContent = 'html { filter: saturate(100%); transition: filter 1.5s ease; }';
+  document.documentElement.appendChild(styleEl);
+
+  function setSaturation(percent) {
+    styleEl.textContent =
+      `html { filter: saturate(${percent}%); transition: filter 1.5s ease; }`;
+  }
+
+  // ── 5. Stage logic ────────────────────────────────────────────────
+  function applyStage() {
+    const stage = STAGES[state.currentStageIdx];
+    setSaturation(stage.saturation);
+    console.log(`[Dogpamine] Stage → ${stage.label} (sat ${stage.saturation}%)`);
+    pushStateToPopup();
+    // T5: overlay rendering on stage.overlay === true && !state.overlayDismissed
+  }
+
+  function isPaused() {
+    return state.pausedUntil && state.pausedUntil > Date.now();
+  }
+
+  function maybeAdvanceStage() {
+    if (state.recentDwells.length < DWELL_WINDOW) return;
+    if (isPaused()) return; // pausedUntil 매 tick 체크
+    const avgSec =
+      state.recentDwells.reduce((a, b) => a + b, 0) / state.recentDwells.length / 1000;
+    for (let i = STAGES.length - 1; i > state.currentStageIdx; i--) {
+      if (avgSec < STAGES[i].dwellLt) {
+        state.currentStageIdx = i;
+        applyStage();
+        return;
+      }
     }
   }
-}
 
-// ── video 단위 dwell 측정 ───────────────────────────────
-// 50% 이상 노출 시 viewStart 기록, 이탈 시 dwell 계산 → recentDwells 슬라이딩 윈도우.
-// Instagram 이 같은 <video> 노드를 재활용하는 경우 (src 만 교체) 대비:
-//   - dataset.dogObserved 는 영구 마커 (observer 중복 부착 방지)
-//   - dataset.dogViewStart 는 진입/이탈마다 set/delete (재진입 시 새 dwell 측정 가능)
-function attachVideoObserver(video) {
-  if (video.dataset.dogObserved) return;
-  video.dataset.dogObserved = '1';
-  state.observedVideoCount++;
+  // ── 6. Video observer (dwell measurement) ─────────────────────────
+  function attachVideoObserver(video) {
+    if (state.videoObservers.has(video)) return;
+    state.observedVideoCount++;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const v = entry.target;
+          const inView = entry.isIntersecting && entry.intersectionRatio >= 0.5;
+          if (inView && !v.dataset.dogViewStart) {
+            v.dataset.dogViewStart = String(Date.now());
+          } else if (!inView && v.dataset.dogViewStart) {
+            const dwellMs = Date.now() - Number(v.dataset.dogViewStart);
+            delete v.dataset.dogViewStart;
+            state.recentDwells.push(dwellMs);
+            if (state.recentDwells.length > DWELL_WINDOW) state.recentDwells.shift();
+            state.measuredDwellCount++;
+            maybeAdvanceStage();
+            pushStateToPopup();
+          }
+        }
+      },
+      { threshold: [0.5] }
+    );
+    obs.observe(video);
+    state.videoObservers.set(video, obs);
+  }
 
-  const obs = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        const v = entry.target;
-        const inView = entry.isIntersecting && entry.intersectionRatio >= 0.5;
-        if (inView && !v.dataset.dogViewStart) {
-          v.dataset.dogViewStart = String(Date.now());
-        } else if (!inView && v.dataset.dogViewStart) {
-          const dwellMs = Date.now() - Number(v.dataset.dogViewStart);
-          delete v.dataset.dogViewStart;
-          state.recentDwells.push(dwellMs);
-          if (state.recentDwells.length > state.dwellWindow) state.recentDwells.shift();
-          state.measuredDwellCount++;
-          maybeAdvanceStage();
+  // ── 7. Video discovery (Eng 8: debounced + idle) ─────────────────
+  let discoveryQueued = false;
+  const discoveryQueue = new Set();
+
+  function queueDiscovery(addedNodes) {
+    for (const node of addedNodes) {
+      if (node.nodeType === 1) discoveryQueue.add(node);
+    }
+    if (discoveryQueued) return;
+    discoveryQueued = true;
+    const flush = () => {
+      discoveryQueued = false;
+      const nodes = Array.from(discoveryQueue);
+      discoveryQueue.clear();
+      for (const node of nodes) {
+        if (!node.isConnected) continue;
+        if (node.tagName === 'VIDEO') attachVideoObserver(node);
+        else if (node.querySelectorAll) {
+          node.querySelectorAll('video').forEach(attachVideoObserver);
         }
       }
-    },
-    { threshold: [0.5] }
-  );
-  obs.observe(video);
-}
-
-// ── 동적 reel 추가 감지 ─────────────────────────────────
-// Instagram 은 SPA + 무한 스크롤 → 새 <video> 가 동적으로 DOM 에 추가됨.
-// document.body 전체 subtree 감시는 무거울 수 있음 (Edge Case #2).
-// 첫 구현: 콘솔에 mutation 카운트를 5초마다 찍어서 폭주 여부 확인.
-let mutationCount = 0;
-const mo = new MutationObserver((mutations) => {
-  for (const m of mutations) {
-    mutationCount++;
-    for (const node of m.addedNodes) {
-      if (node.nodeType !== 1) continue;
-      if (node.tagName === 'VIDEO') attachVideoObserver(node);
-      else node.querySelectorAll && node.querySelectorAll('video').forEach(attachVideoObserver);
+    };
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(flush, { timeout: DISCOVERY_DEBOUNCE_MS });
+    } else {
+      setTimeout(flush, DISCOVERY_DEBOUNCE_MS);
     }
   }
-});
-mo.observe(document.body, { childList: true, subtree: true });
 
-// 초기 진입 시 이미 존재하는 video 들 캡처.
-// run_at: document_idle 이지만 SPA hydration 타이밍에 따라 0개일 수 있음 — MutationObserver 가 채움.
-document.querySelectorAll('main video').forEach(attachVideoObserver);
+  function discoverExisting(root) {
+    if (!root?.querySelectorAll) return;
+    root.querySelectorAll('video').forEach(attachVideoObserver);
+  }
 
-// ── 디버그 로그 (5초마다 한 번) ──────────────────────────
-// 셀렉터 silent 깨짐 감지: observedVideoCount 가 0 으로 정체되면 셀렉터가 안 잡힌 것.
-setInterval(() => {
-  const avg =
-    state.recentDwells.length > 0
-      ? (state.recentDwells.reduce((a, b) => a + b, 0) / state.recentDwells.length / 1000).toFixed(2)
-      : '—';
-  console.log(
-    `[Dogpamine] tick — stage=${STAGES[state.currentStageIdx].label} ` +
-      `observed=${state.observedVideoCount} measured=${state.measuredDwellCount} ` +
-      `avgDwell=${avg}s mutations=${mutationCount}`
-  );
-}, 5000);
+  // ── 8. Attach / detach (Eng 2: full cleanup) ─────────────────────
+  function attach() {
+    if (state.attached) return;
+    state.attached = true;
+    console.log('[Dogpamine] attach on', site.name);
 
-console.log('[Dogpamine] content script loaded on', location.href);
+    const root = site.mutationRoot();
+    const mo = new MutationObserver((mutations) => {
+      const added = [];
+      for (const m of mutations) for (const n of m.addedNodes) added.push(n);
+      if (added.length) queueDiscovery(added);
+    });
+    mo.observe(root, { childList: true, subtree: true });
+    state.mutationObserver = mo;
+
+    discoverExisting(root);
+
+    state.expiryHandle = setInterval(checkExpiry, EXPIRY_CHECK_MS);
+    applyStage();
+  }
+
+  function detach() {
+    if (!state.attached) return;
+    state.attached = false;
+    console.log('[Dogpamine] detach');
+
+    if (state.mutationObserver) {
+      state.mutationObserver.disconnect();
+      state.mutationObserver = null;
+    }
+    state.videoObservers.forEach((obs, video) => {
+      obs.disconnect();
+      delete video.dataset.dogViewStart;
+    });
+    state.videoObservers.clear();
+
+    if (state.expiryHandle) {
+      clearInterval(state.expiryHandle);
+      state.expiryHandle = null;
+    }
+
+    state.currentStageIdx = 0;
+    state.recentDwells = [];
+    state.measuredDwellCount = 0;
+    state.observedVideoCount = 0;
+    state.overlayDismissed = false;
+    setSaturation(100);
+    pushStateToPopup();
+  }
+
+  // ── 9. Self-expiry safety net (Eng 3: SW dormancy) ───────────────
+  async function checkExpiry() {
+    if (!isExtensionAlive()) {
+      // Extension reloaded/uninstalled — cleanup our DOM and bail.
+      detach();
+      styleEl.remove();
+      return;
+    }
+    try {
+      const s = await chrome.storage.local.get([
+        'enabled', 'sessionMode', 'sessionStart',
+      ]);
+      if (!s.enabled) { detach(); return; }
+      if (self.DogpamineSession.isExpired(s.sessionMode, s.sessionStart)) {
+        console.log('[Dogpamine] self-expiry → writing enabled=false');
+        await chrome.storage.local.set({ enabled: false });
+        // storage.onChanged 가 detach() 트리거
+      }
+    } catch {
+      detach();
+    }
+  }
+
+  // ── 10. Push state to popup (throttled) ──────────────────────────
+  function buildSnapshot() {
+    const stage = STAGES[state.currentStageIdx];
+    const avgDwell = state.recentDwells.length > 0
+      ? state.recentDwells.reduce((a, b) => a + b, 0) / state.recentDwells.length / 1000
+      : null;
+    return {
+      stage: stage.label,
+      saturation: state.attached ? stage.saturation : null,
+      measured: state.measuredDwellCount,
+      avgDwell,
+    };
+  }
+
+  function pushStateToPopup() {
+    const now = Date.now();
+    if (now - state.lastPushAt < PUSH_THROTTLE_MS) return;
+    state.lastPushAt = now;
+    if (!isExtensionAlive()) return;
+    try {
+      chrome.runtime.sendMessage({ type: 'state-update', payload: buildSnapshot() })
+        .catch(() => {}); // popup 안 열려있으면 silent fail
+    } catch { /* context invalidated */ }
+  }
+
+  // ── 11. Message handler (popup get-state) ────────────────────────
+  chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+    if (msg?.type === 'get-state') {
+      respond(buildSnapshot());
+    }
+  });
+
+  // ── 12. Storage onChanged ────────────────────────────────────────
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    state.storageChangeCounter++;
+
+    if ('enabled' in changes) {
+      const enabled = changes.enabled.newValue;
+      if (enabled && onSupportedPath()) attach();
+      else if (!enabled) detach();
+    }
+    if ('pausedUntil' in changes) {
+      state.pausedUntil = changes.pausedUntil.newValue;
+      // 일시정지 진입 시 단계 진행 멈춤 (applyStage 안 함, 채도 유지)
+      // 만료 시 다음 dwell tick 에서 자연 재개
+    }
+  });
+
+  // ── 13. Init (race fix: monotonic counter, Eng 1) ────────────────
+  async function init() {
+    if (!onSupportedPath()) return;
+    state.initSnapshotCounter = state.storageChangeCounter;
+    try {
+      const s = await chrome.storage.local.get([
+        'enabled', 'sessionMode', 'sessionStart', 'pausedUntil',
+      ]);
+      if (state.storageChangeCounter > state.initSnapshotCounter) {
+        // onChanged 가 get 사이에 발생 → 핸들러가 이미 신선한 상태 반영함, seed skip.
+        console.log('[Dogpamine] init: onChanged advanced past us, skip seed');
+        return;
+      }
+      state.pausedUntil = s.pausedUntil || null;
+      if (
+        s.enabled &&
+        !self.DogpamineSession.isExpired(s.sessionMode, s.sessionStart)
+      ) {
+        attach();
+      }
+    } catch (e) {
+      console.warn('[Dogpamine] init storage read failed:', e);
+    }
+  }
+
+  // ── 14. SPA navigation (YT/IG pushState) ─────────────────────────
+  let lastPath = location.pathname;
+  setInterval(() => {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    console.log('[Dogpamine] SPA nav →', lastPath);
+    if (onSupportedPath()) init();
+    else detach();
+  }, 1000);
+
+  console.log('[Dogpamine] content script loaded on', site.name, location.pathname);
+  init();
+})();

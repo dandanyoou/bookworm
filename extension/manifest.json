@@ -16,7 +16,7 @@
         "https://www.youtube.com/shorts/*",
         "https://www.instagram.com/reels/*"
       ],
-      "js": ["content.js"],
+      "js": ["lib/session.js", "content.js"],
       "run_at": "document_idle"
     }
   ],
